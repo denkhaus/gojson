@@ -112,6 +112,13 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+type GuessValueTypeFunc func(value interface{}, suggestedType string) (string, error)
+
+//GuessValueTypeDefault is the value guessing default callback
+var GuessValueTypeDefault = func(value interface{}, suggestedType string) (string, error) {
+	return suggestedType, nil
+}
+
 var ForceFloats bool
 
 // commonInitialisms is a set of common initialisms.
@@ -199,6 +206,11 @@ func readFile(input io.Reader) ([]byte, error) {
 
 // Generate a struct definition given a JSON string representation of an object and a name structName.
 func Generate(input io.Reader, parser Parser, structName, pkgName string, tags []string, subStruct bool, convertFloats bool) ([]byte, error) {
+	return GenerateWithTypeGuessing(input, parser, structName, pkgName, tags, subStruct, convertFloats, GuessValueTypeDefault)
+}
+
+// GenerateWithTypeGuessing generates a struct definition with type guessing given a JSON string representation of an object and a name structName.
+func GenerateWithTypeGuessing(input io.Reader, parser Parser, structName, pkgName string, tags []string, subStruct bool, convertFloats bool, guessValueType GuessValueTypeFunc) ([]byte, error) {
 	var subStructMap map[string]string = nil
 	if subStruct {
 		subStructMap = make(map[string]string)
@@ -217,10 +229,13 @@ func Generate(input io.Reader, parser Parser, structName, pkgName string, tags [
 	case map[string]interface{}:
 		result = iresult
 	case []interface{}:
-		src := fmt.Sprintf("package %s\n\ntype %s %s\n",
-			pkgName,
-			structName,
-			typeForValue(iresult, structName, tags, subStructMap, convertFloats))
+		tp, err := typeForValue(iresult, structName, tags, subStructMap, convertFloats, guessValueType)
+		if err != nil {
+			return nil, err
+		}
+
+		src := fmt.Sprintf("package %s\n\ntype %s %s\n", pkgName, structName, tp)
+
 		formatted, err := format.Source([]byte(src))
 		if err != nil {
 			err = fmt.Errorf("error formatting: %s, was formatting\n%s", err, src)
@@ -230,10 +245,12 @@ func Generate(input io.Reader, parser Parser, structName, pkgName string, tags [
 		return nil, fmt.Errorf("unexpected type: %T", iresult)
 	}
 
-	src := fmt.Sprintf("package %s\ntype %s %s}",
-		pkgName,
-		structName,
-		generateTypes(result, structName, tags, 0, subStructMap, convertFloats))
+	str, err := generateTypes(result, structName, tags, 0, subStructMap, convertFloats, guessValueType)
+	if err != nil {
+		return nil, err
+	}
+
+	src := fmt.Sprintf("package %s\ntype %s %s}", pkgName, structName, str)
 
 	keys := make([]string, 0, len(subStructMap))
 	for key := range subStructMap {
@@ -264,8 +281,8 @@ func convertKeysToStrings(obj map[interface{}]interface{}) map[string]interface{
 }
 
 // Generate go struct entries for a map[string]interface{} structure
-func generateTypes(obj map[string]interface{}, structName string, tags []string, depth int, subStructMap map[string]string, convertFloats bool) string {
-	structure := "struct {"
+func generateTypes(obj map[string]interface{}, structName string, tags []string, depth int, subStructMap map[string]string, convertFloats bool, guessValueType GuessValueTypeFunc) (structure string, err error) {
+	structure = "struct {"
 
 	keys := make([]string, 0, len(obj))
 	for key := range obj {
@@ -274,8 +291,18 @@ func generateTypes(obj map[string]interface{}, structName string, tags []string,
 	sort.Strings(keys)
 
 	for _, key := range keys {
+		var valueType string
 		value := obj[key]
-		valueType := typeForValue(value, structName, tags, subStructMap, convertFloats)
+
+		valueType, err = typeForValue(value, structName, tags, subStructMap, convertFloats, guessValueType)
+		if err != nil {
+			return
+		}
+
+		valueType, err = guessValueType(value, valueType)
+		if err != nil {
+			return
+		}
 
 		//value = mergeElements(value)
 
@@ -285,9 +312,20 @@ func generateTypes(obj map[string]interface{}, structName string, tags []string,
 			if len(value) > 0 {
 				sub := ""
 				if v, ok := value[0].(map[interface{}]interface{}); ok {
-					sub = generateTypes(convertKeysToStrings(v), structName, tags, depth+1, subStructMap, convertFloats) + "}"
+					sub, err = generateTypes(convertKeysToStrings(v), structName, tags, depth+1, subStructMap, convertFloats, guessValueType)
+					if err != nil {
+						return
+					}
+
+					sub += "}"
+
 				} else if v, ok := value[0].(map[string]interface{}); ok {
-					sub = generateTypes(v, structName, tags, depth+1, subStructMap, convertFloats) + "}"
+					sub, err = generateTypes(v, structName, tags, depth+1, subStructMap, convertFloats, guessValueType)
+					if err != nil {
+						return
+					}
+
+					sub += "}"
 				}
 
 				if sub != "" {
@@ -303,11 +341,22 @@ func generateTypes(obj map[string]interface{}, structName string, tags []string,
 						}
 					}
 
-					valueType = "[]" + subName
+					valueType, err = guessValueType(value, "[]"+subName)
+					if err != nil {
+						return
+					}
+
 				}
 			}
 		case map[interface{}]interface{}:
-			sub := generateTypes(convertKeysToStrings(value), structName, tags, depth+1, subStructMap, convertFloats) + "}"
+			var sub string
+
+			sub, err = generateTypes(convertKeysToStrings(value), structName, tags, depth+1, subStructMap, convertFloats, guessValueType)
+			if err != nil {
+				return
+			}
+
+			sub += "}"
 			subName := sub
 
 			if subStructMap != nil {
@@ -319,9 +368,21 @@ func generateTypes(obj map[string]interface{}, structName string, tags []string,
 					subStructMap[sub] = subName
 				}
 			}
-			valueType = subName
+
+			valueType, err = guessValueType(value, subName)
+			if err != nil {
+				return
+			}
+
 		case map[string]interface{}:
-			sub := generateTypes(value, structName, tags, depth+1, subStructMap, convertFloats) + "}"
+			var sub string
+
+			sub, err = generateTypes(value, structName, tags, depth+1, subStructMap, convertFloats, guessValueType)
+			if err != nil {
+				return
+			}
+
+			sub += "}"
 			subName := sub
 
 			if subStructMap != nil {
@@ -334,7 +395,10 @@ func generateTypes(obj map[string]interface{}, structName string, tags []string,
 				}
 			}
 
-			valueType = subName
+			valueType, err = guessValueType(value, subName)
+			if err != nil {
+				return
+			}
 		}
 
 		fieldName := FmtFieldName(key)
@@ -349,7 +413,8 @@ func generateTypes(obj map[string]interface{}, structName string, tags []string,
 			valueType,
 			strings.Join(tagList, " "))
 	}
-	return structure
+
+	return structure, nil
 }
 
 // FmtFieldName formats a string as a struct key
@@ -470,29 +535,46 @@ func lintFieldName(name string) string {
 }
 
 // generate an appropriate struct type entry
-func typeForValue(value interface{}, structName string, tags []string, subStructMap map[string]string, convertFloats bool) string {
+func typeForValue(value interface{}, structName string, tags []string, subStructMap map[string]string, convertFloats bool, guessValueType GuessValueTypeFunc) (v string, err error) {
 	//Check if this is an array
 	if objects, ok := value.([]interface{}); ok {
 		types := make(map[reflect.Type]bool, 0)
 		for _, o := range objects {
 			types[reflect.TypeOf(o)] = true
 		}
+
 		if len(types) == 1 {
-			return "[]" + typeForValue(mergeElements(objects).([]interface{})[0], structName, tags, subStructMap, convertFloats)
+			v, err = typeForValue(mergeElements(objects).([]interface{})[0], structName, tags, subStructMap, convertFloats, guessValueType)
+			if err != nil {
+				return
+			}
+
+			return "[]" + v, nil
 		}
-		return "[]interface{}"
+
+		return "[]interface{}", nil
 	} else if object, ok := value.(map[interface{}]interface{}); ok {
-		return generateTypes(convertKeysToStrings(object), structName, tags, 0, subStructMap, convertFloats) + "}"
+		v, err = generateTypes(convertKeysToStrings(object), structName, tags, 0, subStructMap, convertFloats, guessValueType)
+		if err != nil {
+			return
+		}
+		return v + "}", nil
 	} else if object, ok := value.(map[string]interface{}); ok {
-		return generateTypes(object, structName, tags, 0, subStructMap, convertFloats) + "}"
+		v, err = generateTypes(object, structName, tags, 0, subStructMap, convertFloats, guessValueType)
+		if err != nil {
+			return
+		}
+		return v + "}", nil
 	} else if reflect.TypeOf(value) == nil {
-		return "interface{}"
+		return "interface{}", nil
 	}
-	v := reflect.TypeOf(value).Name()
+
+	v = reflect.TypeOf(value).Name()
 	if v == "float64" && convertFloats {
 		v = disambiguateFloatInt(value)
 	}
-	return v
+
+	return v, nil
 }
 
 // All numbers will initially be read as float64
